@@ -19,12 +19,15 @@ if args.base_directory:
 else:
     base_path = os.path.dirname(os.path.realpath(__file__))
 
-models_dir = os.path.join(base_path, "models")
+# models_dir = os.path.join(base_path, "models")
+models_dir = os.path.join("/runpod-volume/ComfyUI", "models")
 folder_names_and_paths["checkpoints"] = ([os.path.join(models_dir, "checkpoints")], supported_pt_extensions)
 folder_names_and_paths["configs"] = ([os.path.join(models_dir, "configs")], [".yaml"])
 
 folder_names_and_paths["loras"] = ([os.path.join(models_dir, "loras")], supported_pt_extensions)
 folder_names_and_paths["vae"] = ([os.path.join(models_dir, "vae")], supported_pt_extensions)
+folder_names_and_paths["clip"] = ([os.path.join(models_dir, "clip")], supported_pt_extensions)
+folder_names_and_paths["unet"] = ([os.path.join(models_dir, "unet")], supported_pt_extensions)
 folder_names_and_paths["text_encoders"] = ([os.path.join(models_dir, "text_encoders"), os.path.join(models_dir, "clip")], supported_pt_extensions)
 folder_names_and_paths["diffusion_models"] = ([os.path.join(models_dir, "unet"), os.path.join(models_dir, "diffusion_models")], supported_pt_extensions)
 folder_names_and_paths["clip_vision"] = ([os.path.join(models_dir, "clip_vision")], supported_pt_extensions)
