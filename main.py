@@ -12,6 +12,9 @@ import utils.extra_config
 import logging
 import sys
 
+import torch
+import subprocess
+
 if __name__ == "__main__":
     #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
@@ -238,6 +241,14 @@ def cleanup_temp():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def is_sage_installed():
+    try:
+        import sageattention
+        return True
+    except ImportError:
+        return False
+
+
 def start_comfyui(asyncio_loop=None):
     """
     Starts the ComfyUI server using the provided asyncio event loop or creates a new one.
@@ -266,6 +277,22 @@ def start_comfyui(asyncio_loop=None):
     hook_breaker_ac10a0.restore_functions()
 
     cuda_malloc_warning()
+
+    try:
+        capability = torch.cuda.get_device_capability()
+        if capability[0] == 9:
+            wheel = os.path.join(os.environ.get("WHEELS_DIR"), "h100_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
+        elif capability[0] == 8:
+            wheel = os.path.join(os.environ.get("WHEELS_DIR"), "4090_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
+        else:
+            wheel = None
+            logging.warning("⚠️ Unknown GPU architecture: compute_{} — no SageAttention installed.".format(capability[0]))
+
+        if wheel and not is_sage_installed():
+            logging.info(f"Installing {wheel} for GPU capability {capability}")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", wheel])
+    except Exception as e:
+        logging.error(f"❌ Failed to auto-install SageAttention: {e}")
 
     prompt_server.add_routes()
     hijack_progress(prompt_server)
