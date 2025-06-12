@@ -255,17 +255,15 @@ def install_sageattention_if_needed():
     arch = get_cuda_arch_safe()
     if arch is None:
         return
-
-    wheel_dir = os.environ.get("WHEELS_DIR", "wheels")
-    if arch == 9:
-        wheel_name = "h100_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl"
+    elif arch == 9:
+        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "H100")
     elif arch == 8:
-        wheel_name = "ada_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl"
+        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "4090")
     else:
         logging.warning(f"Unsupported GPU arch: {arch}, not installing SageAttention.")
         return
 
-    wheel_path = os.path.join(wheel_dir, wheel_name)
+    wheel_path = os.path.join(wheel_dir, "sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
     if not os.path.exists(wheel_path):
         logging.warning(f"SageAttention wheel not found: {wheel_path}")
         return
