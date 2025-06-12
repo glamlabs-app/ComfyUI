@@ -11,8 +11,6 @@ import itertools
 import utils.extra_config
 import logging
 import sys
-
-import torch
 import subprocess
 
 if __name__ == "__main__":
@@ -241,12 +239,44 @@ def cleanup_temp():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def is_sage_installed():
+def get_cuda_arch_safe():
     try:
-        import sageattention
-        return True
-    except ImportError:
-        return False
+        result = subprocess.check_output([
+            sys.executable,
+            "-c",
+            "import torch; print(torch.cuda.get_device_capability()[0])"
+        ], stderr=subprocess.DEVNULL).decode().strip()
+        return int(result)
+    except Exception as e:
+        logging.warning(f"Could not determine GPU arch: {e}")
+        return None
+
+def install_sageattention_if_needed():
+    arch = get_cuda_arch_safe()
+    if arch is None:
+        return
+
+    wheel_dir = os.environ.get("WHEELS_DIR", "wheels")
+    if arch == 9:
+        wheel_name = "h100_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl"
+    elif arch == 8:
+        wheel_name = "ada_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl"
+    else:
+        logging.warning(f"Unsupported GPU arch: {arch}, not installing SageAttention.")
+        return
+
+    wheel_path = os.path.join(wheel_dir, wheel_name)
+    if not os.path.exists(wheel_path):
+        logging.warning(f"SageAttention wheel not found: {wheel_path}")
+        return
+
+    try:
+        import importlib.util
+        if importlib.util.find_spec("sageattention") is None:
+            logging.info(f"Installing SageAttention wheel: {wheel_path}")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", wheel_path])
+    except Exception as e:
+        logging.error(f"Failed to install SageAttention: {e}")
 
 
 def start_comfyui(asyncio_loop=None):
@@ -254,6 +284,8 @@ def start_comfyui(asyncio_loop=None):
     Starts the ComfyUI server using the provided asyncio event loop or creates a new one.
     Returns the event loop, server instance, and a function to start the server asynchronously.
     """
+    install_sageattention_if_needed()
+
     if args.temp_directory:
         temp_dir = os.path.join(os.path.abspath(args.temp_directory), "temp")
         logging.info(f"Setting temp directory to: {temp_dir}")
@@ -277,22 +309,6 @@ def start_comfyui(asyncio_loop=None):
     hook_breaker_ac10a0.restore_functions()
 
     cuda_malloc_warning()
-
-    try:
-        capability = torch.cuda.get_device_capability()
-        if capability[0] == 9:
-            wheel = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "h100_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
-        elif capability[0] == 8:
-            wheel = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "4090_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
-        else:
-            wheel = None
-            logging.warning("⚠️ Unknown GPU architecture: compute_{} — no SageAttention installed.".format(capability[0]))
-
-        if wheel and not is_sage_installed():
-            logging.info(f"Installing {wheel} for GPU capability {capability}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", wheel])
-    except Exception as e:
-        logging.error(f"❌ Failed to auto-install SageAttention: {e}")
 
     prompt_server.add_routes()
     hijack_progress(prompt_server)
