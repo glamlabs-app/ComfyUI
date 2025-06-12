@@ -281,9 +281,9 @@ def start_comfyui(asyncio_loop=None):
     try:
         capability = torch.cuda.get_device_capability()
         if capability[0] == 9:
-            wheel = os.path.join(os.environ.get("WHEELS_DIR"), "h100_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
+            wheel = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "h100_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
         elif capability[0] == 8:
-            wheel = os.path.join(os.environ.get("WHEELS_DIR"), "4090_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
+            wheel = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "4090_sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
         else:
             wheel = None
             logging.warning("⚠️ Unknown GPU architecture: compute_{} — no SageAttention installed.".format(capability[0]))
