@@ -239,51 +239,11 @@ def cleanup_temp():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def get_cuda_arch_safe():
-    try:
-        result = subprocess.check_output([
-            sys.executable,
-            "-c",
-            "import torch; print(torch.cuda.get_device_capability()[0])"
-        ], stderr=subprocess.DEVNULL).decode().strip()
-        return int(result)
-    except Exception as e:
-        logging.warning(f"Could not determine GPU arch: {e}")
-        return None
-
-def install_sageattention_if_needed():
-    arch = get_cuda_arch_safe()
-    if arch is None:
-        return
-    elif arch == 9:
-        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "H100")
-    elif arch == 8:
-        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "4090")
-    else:
-        logging.warning(f"Unsupported GPU arch: {arch}, not installing SageAttention.")
-        return
-
-    wheel_path = os.path.join(wheel_dir, "sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
-    if not os.path.exists(wheel_path):
-        logging.warning(f"SageAttention wheel not found: {wheel_path}")
-        return
-
-    try:
-        import importlib.util
-        if importlib.util.find_spec("sageattention") is None:
-            logging.info(f"Installing SageAttention wheel: {wheel_path}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", wheel_path])
-    except Exception as e:
-        logging.error(f"Failed to install SageAttention: {e}")
-
-
 def start_comfyui(asyncio_loop=None):
     """
     Starts the ComfyUI server using the provided asyncio event loop or creates a new one.
     Returns the event loop, server instance, and a function to start the server asynchronously.
     """
-    install_sageattention_if_needed()
-
     if args.temp_directory:
         temp_dir = os.path.join(os.path.abspath(args.temp_directory), "temp")
         logging.info(f"Setting temp directory to: {temp_dir}")

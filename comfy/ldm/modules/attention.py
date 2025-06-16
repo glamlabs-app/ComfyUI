@@ -1,5 +1,7 @@
 import math
 import sys
+import os
+import subprocess
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,56 @@ from .diffusionmodules.util import AlphaBlender, timestep_embedding
 from .sub_quadratic_attention import efficient_dot_product_attention
 
 from comfy import model_management
+from comfy.cli_args import args
+import comfy.ops
+ops = comfy.ops.disable_weight_init
+
+
+def get_cuda_arch_safe():
+    try:
+        result = subprocess.check_output([
+            sys.executable,
+            "-c",
+            "import torch; print(torch.cuda.get_device_capability()[0])"
+        ], stderr=subprocess.DEVNULL).decode().strip()
+        return int(result)
+    except Exception as e:
+        logging.warning(f"Could not determine GPU arch: {e}")
+        return None
+    
+
+def install_sageattention_if_needed():
+    arch = get_cuda_arch_safe()
+    if arch is None:
+        return
+    elif arch == 9:
+        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "H100")
+    elif arch == 8:
+        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "4090")
+    else:
+        logging.warning(f"Unsupported GPU arch: {arch}, not installing SageAttention.")
+        return
+
+    wheel_path = os.path.join(wheel_dir, "sageattention-2.1.1-cp310-cp310-linux_x86_64.whl")
+    if not os.path.exists(wheel_path):
+        logging.warning(f"SageAttention wheel not found: {wheel_path}")
+        return
+
+    try:
+        import importlib.util
+        if importlib.util.find_spec("sageattention") is None:
+            logging.info(f"Installing SageAttention wheel: {wheel_path}")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", wheel_path])
+            logging.info("SageAttention installed successfully.")
+            args.use_sage_attention = True
+        else:
+            logging.info("SageAttention is already installed.")
+            args.use_sage_attention = True
+    except Exception as e:
+        logging.error(f"Failed to install SageAttention: {e}")
+        args.use_sage_attention = False
+install_sageattention_if_needed()
+
 
 if model_management.xformers_enabled():
     import xformers
@@ -34,9 +86,6 @@ if model_management.flash_attention_enabled():
         logging.error(f"\n\nTo use the `--use-flash-attention` feature, the `flash-attn` package must be installed first.\ncommand:\n\t{sys.executable} -m pip install flash-attn")
         exit(-1)
 
-from comfy.cli_args import args
-import comfy.ops
-ops = comfy.ops.disable_weight_init
 
 FORCE_UPCAST_ATTENTION_DTYPE = model_management.force_upcast_attention_dtype()
 
