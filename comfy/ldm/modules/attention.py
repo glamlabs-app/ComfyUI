@@ -65,6 +65,34 @@ def install_sageattention_if_needed():
 install_sageattention_if_needed()
 
 
+def install_flash_attention_if_needed():
+    arch = get_cuda_arch_safe()
+    if arch is None:
+        return
+    elif arch == 9:
+        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "H100")
+    else:
+        logging.warning(f"Unsupported GPU arch: {arch}, not installing FlashAttention.")
+        return
+
+    wheel_path = os.path.join(wheel_dir, "flash_attn-2.8.0.post2-cp310-cp310-linux_x86_64.whl")
+    if not os.path.exists(wheel_path):
+        logging.warning(f"FlashAttention wheel not found: {wheel_path}")
+        return
+
+    try:
+        import importlib.util
+        if importlib.util.find_spec("flash_attn") is None:
+            logging.info(f"Installing FlashAttention wheel: {wheel_path}")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", wheel_path])
+            logging.info("FlashAttention installed successfully.")
+        else:
+            logging.info("FlashAttention is already installed.")
+    except Exception as e:
+        logging.error(f"Failed to install FlashAttention: {e}")
+install_flash_attention_if_needed()
+
+
 if model_management.xformers_enabled():
     import xformers
     import xformers.ops
