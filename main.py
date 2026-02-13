@@ -5,8 +5,9 @@ import os
 import importlib.util
 import folder_paths
 import time
-from comfy.cli_args import args
+from comfy.cli_args import args, enables_dynamic_vram
 from app.logger import setup_logger
+from app.assets.scanner import seed_assets
 import itertools
 import utils.extra_config
 import logging
@@ -22,6 +23,38 @@ if __name__ == "__main__":
     os.environ['DO_NOT_TRACK'] = '1'
 
 setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
+
+if os.name == "nt":
+    os.environ['MIMALLOC_PURGE_DELAY'] = '0'
+
+if __name__ == "__main__":
+    os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
+    if args.default_device is not None:
+        default_dev = args.default_device
+        devices = list(range(32))
+        devices.remove(default_dev)
+        devices.insert(0, default_dev)
+        devices = ','.join(map(str, devices))
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(devices)
+        os.environ['HIP_VISIBLE_DEVICES'] = str(devices)
+
+    if args.cuda_device is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
+        os.environ['HIP_VISIBLE_DEVICES'] = str(args.cuda_device)
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(args.cuda_device)
+        logging.info("Set cuda device to: {}".format(args.cuda_device))
+
+    if args.oneapi_device_selector is not None:
+        os.environ['ONEAPI_DEVICE_SELECTOR'] = args.oneapi_device_selector
+        logging.info("Set oneapi device selector to: {}".format(args.oneapi_device_selector))
+
+    if args.deterministic:
+        if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
+
+    import cuda_malloc
+    if "rocm" in cuda_malloc.get_torch_version_noimport():
+        os.environ['OCL_SET_SVM_SIZE'] = '262144'  # set at the request of AMD
 
 
 def handle_comfyui_manager_unavailable():
@@ -137,42 +170,9 @@ import shutil
 import threading
 import gc
 
-
-if os.name == "nt":
-    os.environ['MIMALLOC_PURGE_DELAY'] = '0'
-
-if __name__ == "__main__":
-    os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
-    if args.default_device is not None:
-        default_dev = args.default_device
-        devices = list(range(32))
-        devices.remove(default_dev)
-        devices.insert(0, default_dev)
-        devices = ','.join(map(str, devices))
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(devices)
-        os.environ['HIP_VISIBLE_DEVICES'] = str(devices)
-
-    if args.cuda_device is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
-        os.environ['HIP_VISIBLE_DEVICES'] = str(args.cuda_device)
-        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(args.cuda_device)
-        logging.info("Set cuda device to: {}".format(args.cuda_device))
-
-    if args.oneapi_device_selector is not None:
-        os.environ['ONEAPI_DEVICE_SELECTOR'] = args.oneapi_device_selector
-        logging.info("Set oneapi device selector to: {}".format(args.oneapi_device_selector))
-
-    if args.deterministic:
-        if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
-            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
-
-    import cuda_malloc
-    if "rocm" in cuda_malloc.get_torch_version_noimport():
-        os.environ['OCL_SET_SVM_SIZE'] = '262144'  # set at the request of AMD
-
-
 if 'torch' in sys.modules:
     logging.warning("WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.")
+
 
 import comfy.utils
 
@@ -184,6 +184,36 @@ import comfy.model_management
 import comfyui_version
 import app.logger
 import hook_breaker_ac10a0
+
+import comfy.memory_management
+import comfy.model_patcher
+
+import comfy_aimdo.control
+import comfy_aimdo.torch
+
+if enables_dynamic_vram():
+    if comfy.model_management.torch_version_numeric < (2, 8):
+        logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
+        comfy.memory_management.aimdo_allocator = None
+    elif comfy_aimdo.control.init_device(comfy.model_management.get_torch_device().index):
+        if args.verbose == 'DEBUG':
+            comfy_aimdo.control.set_log_debug()
+        elif args.verbose == 'CRITICAL':
+            comfy_aimdo.control.set_log_critical()
+        elif args.verbose == 'ERROR':
+            comfy_aimdo.control.set_log_error()
+        elif args.verbose == 'WARNING':
+            comfy_aimdo.control.set_log_warning()
+        else: #INFO
+            comfy_aimdo.control.set_log_info()
+
+        comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+        comfy.memory_management.aimdo_allocator = comfy_aimdo.torch.get_torch_allocator()
+        logging.info("DynamicVRAM support detected and enabled")
+    else:
+        logging.warning("No working comfy-aimdo install detected. DynamicVRAM support disabled. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
+        comfy.memory_management.aimdo_allocator = None
+
 
 def cuda_malloc_warning():
     device = comfy.model_management.get_torch_device()
@@ -326,6 +356,8 @@ def setup_database():
         from app.database.db import init_db, dependencies_available
         if dependencies_available():
             init_db()
+            if not args.disable_assets_autoscan:
+                seed_assets(["models"], enable_logging=True)
     except Exception as e:
         logging.error(f"Failed to initialize database. Please ensure you have installed the latest requirements. If the error persists, please report this as in future the database will be required: {e}")
 
