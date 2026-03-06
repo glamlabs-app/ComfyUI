@@ -20,14 +20,16 @@ import comfy.ops
 ops = comfy.ops.disable_weight_init
 
 
+_cuda_arch_cache = None
 def get_cuda_arch_safe():
+    global _cuda_arch_cache
+    if _cuda_arch_cache is not None:
+        return _cuda_arch_cache
     try:
-        result = subprocess.check_output([
-            sys.executable,
-            "-c",
-            "import torch; print(torch.cuda.get_device_capability()[0])"
-        ], stderr=subprocess.DEVNULL).decode().strip()
-        return int(result)
+        if not torch.cuda.is_available():
+            return None
+        _cuda_arch_cache = torch.cuda.get_device_capability()[0]
+        return _cuda_arch_cache
     except Exception as e:
         logging.warning(f"Could not determine GPU arch: {e}")
         return None
