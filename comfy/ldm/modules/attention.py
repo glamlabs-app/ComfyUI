@@ -33,7 +33,7 @@ def get_cuda_arch_safe():
     except Exception as e:
         logging.warning(f"Could not determine GPU arch: {e}")
         return None
-    
+
 
 def install_sageattention_if_needed():
     arch = get_cuda_arch_safe()
@@ -146,7 +146,6 @@ def get_attention_function(name: str, default: Any=...) -> Union[Callable, None]
             return default
     return REGISTERED_ATTENTION_FUNCTIONS[name]
 
-from comfy.cli_args import args
 import comfy.ops
 ops = comfy.ops.disable_weight_init
 
