@@ -24,3 +24,8 @@ web_custom_versions/
 openapi.yaml
 filtered-openapi.yaml
 uv.lock
+
+
+/**/*.safetensors 
+/.compile_cache
+compile_cache.bin

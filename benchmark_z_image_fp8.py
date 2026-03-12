@@ -24,6 +24,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 
 import torch
 
@@ -263,8 +264,38 @@ class CUDAGraphRunner:
         return self.static_output
 
 
+def _load_compile_cache(cache_path: str) -> bool:
+    """Load torch.compile mega-cache from a binary file. Returns True on success."""
+    p = Path(cache_path)
+    if not p.exists():
+        return False
+    t0 = time.perf_counter()
+    artifact_bytes = p.read_bytes()
+    torch.compiler.load_cache_artifacts(artifact_bytes)
+    elapsed = time.perf_counter() - t0
+    print(f"  Loaded compile cache from {p} ({len(artifact_bytes)/1024/1024:.1f} MB) in {elapsed:.1f}s")
+    return True
+
+
+def _save_compile_cache(cache_path: str):
+    """Save torch.compile mega-cache to a binary file."""
+    p = Path(cache_path)
+    if p.exists():
+        return
+    t0 = time.perf_counter()
+    result = torch.compiler.save_cache_artifacts()
+    if result is None:
+        print("  Warning: save_cache_artifacts() returned None — no cache to save")
+        return
+    artifact_bytes, cache_info = result
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(artifact_bytes)
+    elapsed = time.perf_counter() - t0
+    print(f"  Saved compile cache to {p} ({len(artifact_bytes)/1024/1024:.1f} MB) in {elapsed:.1f}s")
+
+
 def load_model(unet_path: str, weight_dtype_name: str, compile_mode: str = None,
-               cuda_graph: bool = False):
+               cuda_graph: bool = False, cache_file: str = None):
     model_options = {}
     if weight_dtype_name == "fp8_e4m3fn":
         model_options["dtype"] = torch.float8_e4m3fn
@@ -282,6 +313,9 @@ def load_model(unet_path: str, weight_dtype_name: str, compile_mode: str = None,
     print(f"  Model loaded in {load_time:.2f}s")
 
     if compile_mode:
+        if cache_file:
+            _load_compile_cache(cache_file)
+
         from comfy.ldm.lumina.model import JointTransformerBlock
         import torch._dynamo.config
         diffusion_model = model.model.diffusion_model
@@ -686,6 +720,13 @@ def main():
         help="Run torch.profiler to show CUDA kernel time breakdown (attention vs FFN vs other)"
     )
     parser.add_argument(
+        "--cache-file", type=str, default=None,
+        help="Path to a torch.compile mega-cache file (.bin). "
+             "If the file exists, compiled artifacts are loaded from it before compilation "
+             "(speeding up warm start). After the first run, artifacts are saved to this file "
+             "if it doesn't already exist. Requires --compile."
+    )
+    parser.add_argument(
         "--output_json", type=str, default=None,
         help="Optional path to write results as JSON"
     )
@@ -697,6 +738,11 @@ def main():
         print(f"  Install: {sys.executable} -m pip install sageattention --no-build-isolation", file=sys.stderr)
         sys.exit(1)
 
+    cache_file = getattr(args, "cache_file", None)
+    if cache_file and args.compile is None:
+        print("ERROR: --cache-file requires --compile", file=sys.stderr)
+        sys.exit(1)
+
     unet_path = args.unet_path
     if not os.path.isabs(unet_path):
         unet_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), unet_path)
@@ -706,7 +752,7 @@ def main():
         sys.exit(1)
 
     model = load_model(unet_path, args.weight_dtype, compile_mode=args.compile,
-                       cuda_graph=args.cuda_graph)
+                       cuda_graph=args.cuda_graph, cache_file=cache_file)
 
     if args.profile:
         w, h = parse_resolution(args.resolutions[0])
@@ -716,6 +762,8 @@ def main():
             profile_one_run(model, w, h, args.steps[0], args.batch_sizes[0],
                             args.sampler, args.scheduler, args.cfg, backend,
                             is_compiled=has_capture_overhead)
+        if cache_file:
+            _save_compile_cache(cache_file)
         return
 
     # ---- Raw mode: direct apply_model loop, no comfy.sample overhead ----
@@ -761,6 +809,9 @@ def main():
                     print(f"\n  Median: {med:.3f}s  ({med/steps*1000:.0f} ms/step)  "
                           f"Min: {min(times):.3f}s  Max: {max(times):.3f}s  "
                           f"VRAM: {mem.get('peak_gb', 0):.2f} GB")
+
+        if cache_file:
+            _save_compile_cache(cache_file)
         return
 
     # ---- Normal mode: through comfy.sample.sample ----
@@ -793,6 +844,9 @@ def main():
                         is_compiled=has_capture_overhead,
                     )
                     results.append(r)
+
+    if cache_file:
+        _save_compile_cache(cache_file)
 
     print_summary(results)
 
