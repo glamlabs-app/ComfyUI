@@ -125,6 +125,8 @@ def Normalize(in_channels, dtype=None, device=None):
 def wrap_attn(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return func(*args, **kwargs)
         remove_attn_wrapper_key = False
         try:
             if "_inside_attn_wrapper" not in kwargs:

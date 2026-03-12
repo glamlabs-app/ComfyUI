@@ -758,6 +758,7 @@ class NextDiT(nn.Module):
         cap_feats = torch.cat(embeds[0], dim=1)
         cap_freqs_cis = torch.cat(freqs_cis[0], dim=1)
         for layer in self.context_refiner:
+            torch.compiler.cudagraph_mark_step_begin()
             cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis, transformer_options=transformer_options)
 
         feats = (cap_feats,)
@@ -783,6 +784,7 @@ class NextDiT(nn.Module):
 
         x_input = x
         for i, layer in enumerate(self.noise_refiner):
+            torch.compiler.cudagraph_mark_step_begin()
             x = layer(x, padded_img_mask, fc_x, t, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options)
             if "noise_refiner" in patches:
                 for p in patches["noise_refiner"]:
@@ -845,6 +847,7 @@ class NextDiT(nn.Module):
         transformer_options["block_type"] = "double"
         img_input = img
         for i, layer in enumerate(self.layers):
+            torch.compiler.cudagraph_mark_step_begin()
             transformer_options["block_index"] = i
             img = layer(img, mask, freqs_cis, adaln_input, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options)
             if "double_block" in patches:
