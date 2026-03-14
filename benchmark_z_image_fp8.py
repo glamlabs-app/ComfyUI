@@ -200,6 +200,32 @@ def _dequant_fp8_to_bf16(model_patcher):
     return converted
 
 
+def _enable_fp8_matmul(model_patcher, dynamic_input_scale=True):
+    """Override _full_precision_mm on all quantized linear layers to enable
+    direct FP8 matmul via torch._scaled_mm instead of dequant-to-bf16.
+
+    When dynamic_input_scale=True, layers without a stored input_scale get
+    'recalculate' so the input is scaled to fill the FP8 dynamic range.
+    Without this, activations that exceed 448 are clamped and destroyed.
+    """
+    diffusion_model = model_patcher.model.diffusion_model
+    converted = 0
+    rescaled = 0
+    for name, module in diffusion_model.named_modules():
+        if getattr(module, '_full_precision_mm', False) and getattr(module, 'layout_type', None) is not None:
+            module._full_precision_mm = False
+            converted += 1
+            if dynamic_input_scale and getattr(module, 'input_scale', None) is None:
+                module.input_scale = "recalculate"
+                rescaled += 1
+    if converted:
+        msg = f"  Enabled direct FP8 matmul on {converted} layers"
+        if rescaled:
+            msg += f" ({rescaled} with dynamic input scaling)"
+        print(msg)
+    return converted
+
+
 class CUDAGraphRunner:
     """Captures a CUDA graph of the diffusion model's forward pass.
 
@@ -312,19 +338,22 @@ def load_model(unet_path: str, weight_dtype_name: str, compile_mode: str = None,
     load_time = time.perf_counter() - t0
     print(f"  Model loaded in {load_time:.2f}s")
 
+    if weight_dtype_name == "fp8_e4m3fn_fast":
+        _enable_fp8_matmul(model)
+
     if compile_mode:
         if cache_file:
             _load_compile_cache(cache_file)
 
         from comfy.ldm.lumina.model import JointTransformerBlock
-        import torch._dynamo.config
+        import torch._dynamo.config as _dynamo_config
         diffusion_model = model.model.diffusion_model
         n_blocks = sum(1 for _, m in diffusion_model.named_modules()
                        if isinstance(m, JointTransformerBlock))
-        torch._dynamo.config.cache_size_limit = max(n_blocks + 8,
-                                                     torch._dynamo.config.cache_size_limit)
+        _dynamo_config.cache_size_limit = max(n_blocks + 8,
+                                               _dynamo_config.cache_size_limit)
         print(f"  torch.compile mode: {compile_mode} (full JointTransformerBlock)")
-        print(f"  dynamo cache_size_limit raised to {torch._dynamo.config.cache_size_limit}")
+        print(f"  dynamo cache_size_limit raised to {_dynamo_config.cache_size_limit}")
         compiled_count = 0
         for name, module in diffusion_model.named_modules():
             if isinstance(module, JointTransformerBlock):
@@ -422,6 +451,8 @@ def run_raw_denoising(
     """Euler denoising loop calling apply_model directly. Returns elapsed seconds."""
     device = model_patcher.load_device
     dtype = model_patcher.model_dtype()
+    compute_dtype = dtype if dtype.is_floating_point and dtype not in (
+        torch.float8_e4m3fn, torch.float8_e5m2) else torch.bfloat16
     latent_format = real_model.latent_format
     latent_channels = latent_format.latent_channels
     downscale = latent_format.spacial_downscale_ratio
@@ -440,7 +471,7 @@ def run_raw_denoising(
 
     seq_len = 64
     cond_dim = 2560
-    context = torch.randn(batch_size, seq_len, cond_dim, device=device, dtype=dtype)
+    context = torch.randn(batch_size, seq_len, cond_dim, device=device, dtype=compute_dtype)
     transformer_options = {"cond_or_uncond": [0]}
 
     extra_conds = {"num_tokens": seq_len}
@@ -646,6 +677,148 @@ def profile_one_run(model, width, height, steps, batch_size, sampler_name, sched
 
 
 # ---------------------------------------------------------------------------
+# Quality comparison — FP8 fast vs dequant baseline
+# ---------------------------------------------------------------------------
+
+def _run_single_apply_model(real_model, x, sigma, context, transformer_options, extra_conds):
+    """Run one apply_model call and return the denoised output."""
+    s_in = x.new_ones([x.shape[0]])
+    timestep = sigma * s_in
+    with torch.no_grad():
+        return real_model.apply_model(
+            x, timestep,
+            c_crossattn=context,
+            transformer_options=transformer_options,
+            **extra_conds,
+        )
+
+
+def _set_full_precision_mm(diffusion_model, value: bool, dynamic_input_scale: bool = False):
+    """Set _full_precision_mm on all quantized linear layers.
+    When value=False and dynamic_input_scale=True, also sets input_scale='recalculate'
+    so activations are properly scaled into the FP8 dynamic range."""
+    for module in diffusion_model.modules():
+        if getattr(module, 'layout_type', None) is not None and hasattr(module, '_full_precision_mm'):
+            module._full_precision_mm = value
+            if not value and dynamic_input_scale:
+                if getattr(module, 'input_scale', None) is None:
+                    module.input_scale = "recalculate"
+            elif value:
+                if getattr(module, 'input_scale', None) == "recalculate":
+                    module.input_scale = None
+
+
+def compare_fp8_quality(
+    model_patcher,
+    width: int,
+    height: int,
+    steps: int,
+    scheduler: str,
+    seeds: list[int],
+):
+    """Compare denoised outputs between dequant-bf16 and direct FP8 matmul paths."""
+    real_model = _ensure_model_on_gpu(model_patcher)
+    device = model_patcher.load_device
+    dtype = model_patcher.model_dtype()
+    compute_dtype = dtype if dtype.is_floating_point and dtype not in (
+        torch.float8_e4m3fn, torch.float8_e5m2) else torch.bfloat16
+    latent_format = real_model.latent_format
+    latent_channels = latent_format.latent_channels
+    downscale = latent_format.spacial_downscale_ratio
+    model_sampling = real_model.model_sampling
+    dm = model_patcher.model.diffusion_model
+
+    latent_h = height // downscale
+    latent_w = width // downscale
+
+    sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps).to(device)
+    seq_len = 64
+    cond_dim = 2560
+    transformer_options = {"cond_or_uncond": [0]}
+    extra_conds = {"num_tokens": seq_len}
+
+    print(f"\n{'='*72}")
+    print(f"  Quality comparison: dequant-bf16 vs direct FP8 matmul")
+    print(f"  Resolution: {width}x{height}  |  Steps: {steps}  |  Seeds: {seeds}")
+    print(f"{'='*72}")
+
+    for seed in seeds:
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(1, latent_channels, latent_h, latent_w,
+                            generator=g, device="cpu", dtype=torch.float32).to(device)
+        latent_image = torch.zeros_like(noise)
+        x_init = model_sampling.noise_scaling(sigmas[0], noise, latent_image, max_denoise=True)
+
+        g2 = torch.Generator(device="cpu").manual_seed(seed + 10000)
+        context = torch.randn(1, seq_len, cond_dim, dtype=compute_dtype, generator=g2).to(device)
+
+        # --- Run full denoising with both paths ---
+        all_bf16_outputs = []
+        all_fp8_outputs = []
+
+        for step_i in range(len(sigmas) - 1):
+            sigma = sigmas[step_i]
+
+            if step_i == 0:
+                x_bf16 = x_init.clone()
+                x_fp8 = x_init.clone()
+
+            # Dequant-bf16 path (baseline)
+            _set_full_precision_mm(dm, True)
+            denoised_bf16 = _run_single_apply_model(
+                real_model, x_bf16, sigma, context, transformer_options, extra_conds)
+            all_bf16_outputs.append(denoised_bf16.clone())
+
+            # Direct FP8 path with dynamic input scaling
+            _set_full_precision_mm(dm, False, dynamic_input_scale=True)
+            denoised_fp8 = _run_single_apply_model(
+                real_model, x_fp8, sigma, context, transformer_options, extra_conds)
+            all_fp8_outputs.append(denoised_fp8.clone())
+
+            # Euler step — advance each path with its own output
+            dt = sigmas[step_i + 1] - sigma
+            x_bf16 = x_bf16 + (x_bf16 - denoised_bf16) / sigma * dt
+            x_fp8 = x_fp8 + (x_fp8 - denoised_fp8) / sigma * dt
+
+        # --- Per-step metrics ---
+        print(f"\n  Seed {seed}:")
+        print(f"  {'Step':<6} {'Cosine↑':>10} {'L2':>12} {'MAE':>12} {'MaxAE':>12} {'RelErr%':>10} {'SNR(dB)':>10}")
+        print(f"  {'-'*66}")
+
+        for step_i, (out_bf16, out_fp8) in enumerate(zip(all_bf16_outputs, all_fp8_outputs)):
+            a = out_bf16.float().flatten()
+            b = out_fp8.float().flatten()
+            diff = a - b
+
+            cosine = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+            l2 = diff.norm(2).item()
+            mae = diff.abs().mean().item()
+            max_ae = diff.abs().max().item()
+            rel_err = (diff.abs() / (a.abs() + 1e-8)).mean().item() * 100
+            signal_power = (a ** 2).mean()
+            noise_power = (diff ** 2).mean()
+            snr_db = 10 * torch.log10(signal_power / (noise_power + 1e-12)).item()
+
+            print(f"  {step_i:<6} {cosine:>10.6f} {l2:>12.4f} {mae:>12.6f} {max_ae:>12.4f} {rel_err:>9.4f}% {snr_db:>9.2f}")
+
+        # --- Final latent comparison ---
+        a = x_bf16.float().flatten()
+        b = x_fp8.float().flatten()
+        diff = a - b
+        cosine = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+        l2 = diff.norm(2).item()
+        mae = diff.abs().mean().item()
+        max_ae = diff.abs().max().item()
+        rel_err = (diff.abs() / (a.abs() + 1e-8)).mean().item() * 100
+        signal_power = (a ** 2).mean()
+        noise_power = (diff ** 2).mean()
+        snr_db = 10 * torch.log10(signal_power / (noise_power + 1e-12)).item()
+
+        print(f"  {'-'*66}")
+        print(f"  {'FINAL':<6} {cosine:>10.6f} {l2:>12.4f} {mae:>12.6f} {max_ae:>12.4f} {rel_err:>9.4f}% {snr_db:>9.2f}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -727,6 +900,11 @@ def main():
              "if it doesn't already exist. Requires --compile."
     )
     parser.add_argument(
+        "--quality", action="store_true",
+        help="Compare output quality between dequant-bf16 and direct FP8 matmul paths. "
+             "Runs both paths with identical inputs and reports cosine similarity, L2, MAE, etc."
+    )
+    parser.add_argument(
         "--output_json", type=str, default=None,
         help="Optional path to write results as JSON"
     )
@@ -764,6 +942,19 @@ def main():
                             is_compiled=has_capture_overhead)
         if cache_file:
             _save_compile_cache(cache_file)
+        return
+
+    # ---- Quality comparison mode ----
+    if args.quality:
+        set_attention_backend(args.attention if args.attention != "both" else "default")
+        for res_str in args.resolutions:
+            w, h = parse_resolution(res_str)
+            compare_fp8_quality(
+                model, w, h,
+                steps=args.steps[0],
+                scheduler=args.scheduler,
+                seeds=[42, 123, 777],
+            )
         return
 
     # ---- Raw mode: direct apply_model loop, no comfy.sample overhead ----

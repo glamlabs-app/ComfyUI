@@ -901,7 +901,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         reshaped_3d = input.ndim == 3
                         # dtype is now implicit in the layout class
                         scale = getattr(self, 'input_scale', None)
-                        if scale is not None:
+                        if isinstance(scale, torch.Tensor):
                             scale = comfy.model_management.cast_to_device(scale, input.device, None)
                         input = QuantizedTensor.from_float(input_reshaped, self.layout_type, scale=scale)
 
