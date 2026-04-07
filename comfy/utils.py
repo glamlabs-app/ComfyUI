@@ -20,7 +20,9 @@
 import torch
 import math
 import struct
-import comfy.checkpoint_pickle
+import ctypes
+import os
+import comfy.memory_management
 import safetensors.torch
 import numpy as np
 from PIL import Image
@@ -29,35 +31,35 @@ import itertools
 from torch.nn.functional import interpolate
 from tqdm.auto import trange
 from einops import rearrange
-from comfy.cli_args import args, enables_dynamic_vram
+from comfy.cli_args import args
 import json
 import time
-import mmap
+import threading
 import warnings
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
 
-ALWAYS_SAFE_LOAD = False
-if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in pytorch 2.4, the unsafe path should be removed once earlier versions are deprecated
+
+if True:  # ckpt/pt file whitelist for safe loading of old sd files
     class ModelCheckpoint:
         pass
     ModelCheckpoint.__module__ = "pytorch_lightning.callbacks.model_checkpoint"
 
     def scalar(*args, **kwargs):
-        from numpy.core.multiarray import scalar as sc
-        return sc(*args, **kwargs)
+        return None
     scalar.__module__ = "numpy.core.multiarray"
 
     from numpy import dtype
     from numpy.dtypes import Float64DType
-    from _codecs import encode
+
+    def encode(*args, **kwargs):  # no longer necessary on newer torch
+        return None
+    encode.__module__ = "_codecs"
 
     torch.serialization.add_safe_globals([ModelCheckpoint, scalar, dtype, Float64DType, encode])
-    ALWAYS_SAFE_LOAD = True
     logging.info("Checkpoint files will always be loaded safely.")
-else:
-    logging.warning("Warning, you are using an old pytorch version and some ckpt/pt files might be loaded unsafely. Upgrading to 2.4 or above is recommended as older versions of pytorch are no longer supported.")
+
 
 # Current as of safetensors 0.7.0
 _TYPES = {
@@ -81,14 +83,17 @@ _TYPES = {
 }
 
 def load_safetensors(ckpt):
-    f = open(ckpt, "rb")
-    mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    mv = memoryview(mapping)
+    import comfy_aimdo.model_mmap
 
-    header_size = struct.unpack("<Q", mapping[:8])[0]
-    header = json.loads(mapping[8:8+header_size].decode("utf-8"))
+    f = open(ckpt, "rb", buffering=0)
+    model_mmap = comfy_aimdo.model_mmap.ModelMMAP(ckpt)
+    file_size = os.path.getsize(ckpt)
+    mv = memoryview((ctypes.c_uint8 * file_size).from_address(model_mmap.get()))
 
-    mv = mv[8 + header_size:]
+    header_size = struct.unpack("<Q", mv[:8])[0]
+    header = json.loads(mv[8:8 + header_size].tobytes().decode("utf-8"))
+
+    mv = mv[(data_base_offset := 8 + header_size):]
 
     sd = {}
     for name, info in header.items():
@@ -102,7 +107,14 @@ def load_safetensors(ckpt):
             with warnings.catch_warnings():
                 #We are working with read-only RAM by design
                 warnings.filterwarnings("ignore", message="The given buffer is not writable")
-                sd[name] = torch.frombuffer(mv[start:end], dtype=_TYPES[info["dtype"]]).view(info["shape"])
+                tensor = torch.frombuffer(mv[start:end], dtype=_TYPES[info["dtype"]]).view(info["shape"])
+                storage = tensor.untyped_storage()
+                setattr(storage,
+                        "_comfy_tensor_file_slice",
+                        comfy.memory_management.TensorFileSlice(f, threading.get_ident(), data_base_offset + start, end - start))
+                setattr(storage, "_comfy_tensor_mmap_refs", (model_mmap, mv))
+                setattr(storage, "_comfy_tensor_mmap_touched", False)
+                sd[name] = tensor
 
     return sd, header.get("__metadata__", {}),
 
@@ -113,7 +125,7 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     metadata = None
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
-            if enables_dynamic_vram():
+            if comfy.memory_management.aimdo_enabled:
                 sd, metadata = load_safetensors(ckpt)
                 if not return_metadata:
                     metadata = None
@@ -140,11 +152,8 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
         if MMAP_TORCH_FILES:
             torch_args["mmap"] = True
 
-        if safe_load or ALWAYS_SAFE_LOAD:
-            pl_sd = torch.load(ckpt, map_location=device, weights_only=True, **torch_args)
-        else:
-            logging.warning("WARNING: loading {} unsafely, upgrade your pytorch to 2.4 or newer to load this file safely.".format(ckpt))
-            pl_sd = torch.load(ckpt, map_location=device, pickle_module=comfy.checkpoint_pickle)
+        pl_sd = torch.load(ckpt, map_location=device, weights_only=True, **torch_args)
+
         if "state_dict" in pl_sd:
             sd = pl_sd["state_dict"]
         else:
@@ -675,10 +684,10 @@ def flux_to_diffusers(mmdit_config, output_prefix=""):
                         "ff_context.linear_in.bias": "txt_mlp.0.bias",
                         "ff_context.linear_out.weight": "txt_mlp.2.weight",
                         "ff_context.linear_out.bias": "txt_mlp.2.bias",
-                        "attn.norm_q.weight": "img_attn.norm.query_norm.scale",
-                        "attn.norm_k.weight": "img_attn.norm.key_norm.scale",
-                        "attn.norm_added_q.weight": "txt_attn.norm.query_norm.scale",
-                        "attn.norm_added_k.weight": "txt_attn.norm.key_norm.scale",
+                        "attn.norm_q.weight": "img_attn.norm.query_norm.weight",
+                        "attn.norm_k.weight": "img_attn.norm.key_norm.weight",
+                        "attn.norm_added_q.weight": "txt_attn.norm.query_norm.weight",
+                        "attn.norm_added_k.weight": "txt_attn.norm.key_norm.weight",
                     }
 
         for k in block_map:
@@ -701,8 +710,8 @@ def flux_to_diffusers(mmdit_config, output_prefix=""):
                         "norm.linear.bias": "modulation.lin.bias",
                         "proj_out.weight": "linear2.weight",
                         "proj_out.bias": "linear2.bias",
-                        "attn.norm_q.weight": "norm.query_norm.scale",
-                        "attn.norm_k.weight": "norm.key_norm.scale",
+                        "attn.norm_q.weight": "norm.query_norm.weight",
+                        "attn.norm_k.weight": "norm.key_norm.weight",
                         "attn.to_qkv_mlp_proj.weight": "linear1.weight", # Flux 2
                         "attn.to_out.weight": "linear2.weight", # Flux 2
                     }
@@ -872,19 +881,34 @@ def safetensors_header(safetensors_path, max_size=100*1024*1024):
 
 ATTR_UNSET={}
 
-def set_attr(obj, attr, value):
+def resolve_attr(obj, attr):
     attrs = attr.split(".")
     for name in attrs[:-1]:
         obj = getattr(obj, name)
-    prev = getattr(obj, attrs[-1], ATTR_UNSET)
+    return obj, attrs[-1]
+
+def set_attr(obj, attr, value):
+    obj, name = resolve_attr(obj, attr)
+    prev = getattr(obj, name, ATTR_UNSET)
     if value is ATTR_UNSET:
-        delattr(obj, attrs[-1])
+        delattr(obj, name)
     else:
-        setattr(obj, attrs[-1], value)
+        setattr(obj, name, value)
     return prev
 
 def set_attr_param(obj, attr, value):
+    # Clone inference tensors (created under torch.inference_mode) since
+    # their version counter is frozen and nn.Parameter() cannot wrap them.
+    if (not torch.is_inference_mode_enabled()) and value.is_inference():
+        value = value.clone()
     return set_attr(obj, attr, torch.nn.Parameter(value, requires_grad=False))
+
+def set_attr_buffer(obj, attr, value):
+    obj, name = resolve_attr(obj, attr)
+    prev = getattr(obj, name, ATTR_UNSET)
+    persistent = name not in getattr(obj, "_non_persistent_buffers_set", set())
+    obj.register_buffer(name, value, persistent=persistent)
+    return prev
 
 def copy_to_param(obj, attr, value):
     # inplace update tensor instead of replacing it
@@ -1111,8 +1135,8 @@ def tiled_scale_multidim(samples, function, tile=(64, 64), overlap=8, upscale_am
                 pbar.update(1)
             continue
 
-        out = torch.zeros([s.shape[0], out_channels] + mult_list_upscale(s.shape[2:]), device=output_device)
-        out_div = torch.zeros([s.shape[0], out_channels] + mult_list_upscale(s.shape[2:]), device=output_device)
+        out = output[b:b+1].zero_()
+        out_div = torch.zeros([s.shape[0], 1] + mult_list_upscale(s.shape[2:]), device=output_device)
 
         positions = [range(0, s.shape[d+2] - overlap[d], tile[d] - overlap[d]) if s.shape[d+2] > tile[d] else [0] for d in range(dims)]
 
@@ -1127,7 +1151,7 @@ def tiled_scale_multidim(samples, function, tile=(64, 64), overlap=8, upscale_am
                 upscaled.append(round(get_pos(d, pos)))
 
             ps = function(s_in).to(output_device)
-            mask = torch.ones_like(ps)
+            mask = torch.ones([1, 1] + list(ps.shape[2:]), device=output_device)
 
             for d in range(2, dims + 2):
                 feather = round(get_scale(d - 2, overlap[d - 2]))
@@ -1150,14 +1174,14 @@ def tiled_scale_multidim(samples, function, tile=(64, 64), overlap=8, upscale_am
             if pbar is not None:
                 pbar.update(1)
 
-        output[b:b+1] = out/out_div
+        out.div_(out_div)
     return output
 
 def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap = 8, upscale_amount = 4, out_channels = 3, output_device="cpu", pbar = None):
     return tiled_scale_multidim(samples, function, (tile_y, tile_x), overlap=overlap, upscale_amount=upscale_amount, out_channels=out_channels, output_device=output_device, pbar=pbar)
 
 def model_trange(*args, **kwargs):
-    if comfy.memory_management.aimdo_allocator is None:
+    if not comfy.memory_management.aimdo_enabled:
         return trange(*args, **kwargs)
 
     pbar = trange(*args, **kwargs, smoothing=1.0)
@@ -1421,3 +1445,11 @@ def deepcopy_list_dict(obj, memo=None):
 
     memo[obj_id] = res
     return res
+
+def normalize_image_embeddings(embeds, embeds_info, scale_factor):
+    """Normalize image embeddings to match text embedding scale"""
+    for info in embeds_info:
+        if info.get("type") == "image":
+            start_idx = info["index"]
+            end_idx = start_idx + info["size"]
+            embeds[:, start_idx:end_idx, :] /= scale_factor

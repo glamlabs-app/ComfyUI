@@ -19,7 +19,9 @@ class Blend(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="ImageBlend",
+            display_name="Image Blend",
             category="image/postprocessing",
+            essentials_category="Image Tools",
             inputs=[
                 io.Image.Input("image1"),
                 io.Image.Input("image2"),
@@ -65,17 +67,18 @@ class Blend(io.ComfyNode):
     def g(cls, x):
         return torch.where(x <= 0.25, ((16 * x - 12) * x + 4) * x, torch.sqrt(x))
 
-def gaussian_kernel(kernel_size: int, sigma: float, device=None):
+def gaussian_kernel(kernel_size: int, sigma: float, device=None, dtype=torch.float32):
     x, y = torch.meshgrid(torch.linspace(-1, 1, kernel_size, device=device), torch.linspace(-1, 1, kernel_size, device=device), indexing="ij")
     d = torch.sqrt(x * x + y * y)
     g = torch.exp(-(d * d) / (2.0 * sigma * sigma))
-    return g / g.sum()
+    return (g / g.sum()).to(dtype)
 
 class Blur(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="ImageBlur",
+            display_name="Image Blur",
             category="image/postprocessing",
             inputs=[
                 io.Image.Input("image"),
@@ -96,7 +99,7 @@ class Blur(io.ComfyNode):
         batch_size, height, width, channels = image.shape
 
         kernel_size = blur_radius * 2 + 1
-        kernel = gaussian_kernel(kernel_size, sigma, device=image.device).repeat(channels, 1, 1).unsqueeze(1)
+        kernel = gaussian_kernel(kernel_size, sigma, device=image.device, dtype=image.dtype).repeat(channels, 1, 1).unsqueeze(1)
 
         image = image.permute(0, 3, 1, 2) # Torch wants (B, C, H, W) we use (B, H, W, C)
         padded_image = F.pad(image, (blur_radius,blur_radius,blur_radius,blur_radius), 'reflect')
@@ -179,9 +182,9 @@ class Sharpen(io.ComfyNode):
             category="image/postprocessing",
             inputs=[
                 io.Image.Input("image"),
-                io.Int.Input("sharpen_radius", default=1, min=1, max=31, step=1),
-                io.Float.Input("sigma", default=1.0, min=0.1, max=10.0, step=0.01),
-                io.Float.Input("alpha", default=1.0, min=0.0, max=5.0, step=0.01),
+                io.Int.Input("sharpen_radius", default=1, min=1, max=31, step=1, advanced=True),
+                io.Float.Input("sigma", default=1.0, min=0.1, max=10.0, step=0.01, advanced=True),
+                io.Float.Input("alpha", default=1.0, min=0.0, max=5.0, step=0.01, advanced=True),
             ],
             outputs=[
                 io.Image.Output(),
@@ -197,7 +200,7 @@ class Sharpen(io.ComfyNode):
         image = image.to(comfy.model_management.get_torch_device())
 
         kernel_size = sharpen_radius * 2 + 1
-        kernel = gaussian_kernel(kernel_size, sigma, device=image.device) * -(alpha*10)
+        kernel = gaussian_kernel(kernel_size, sigma, device=image.device, dtype=image.dtype) * -(alpha*10)
         kernel = kernel.to(dtype=image.dtype)
         center = kernel_size // 2
         kernel[center, center] = kernel[center, center] - kernel.sum() + 1.0
@@ -225,7 +228,7 @@ class ImageScaleToTotalPixels(io.ComfyNode):
                 io.Image.Input("image"),
                 io.Combo.Input("upscale_method", options=cls.upscale_methods),
                 io.Float.Input("megapixels", default=1.0, min=0.01, max=16.0, step=0.01),
-                io.Int.Input("resolution_steps", default=1, min=1, max=256),
+                io.Int.Input("resolution_steps", default=1, min=1, max=256, advanced=True),
             ],
             outputs=[
                 io.Image.Output(),
@@ -565,6 +568,7 @@ class BatchImagesNode(io.ComfyNode):
             node_id="BatchImagesNode",
             display_name="Batch Images",
             category="image",
+            essentials_category="Image Tools",
             search_aliases=["batch", "image batch", "batch images", "combine images", "merge images", "stack images"],
             inputs=[
                 io.Autogrow.Input("images", template=autogrow_template)
@@ -654,6 +658,7 @@ class BatchImagesMasksLatentsNode(io.ComfyNode):
         else:
             batched = batch_masks(values)
         return io.NodeOutput(batched)
+
 
 class PostProcessingExtension(ComfyExtension):
     @override
