@@ -1310,8 +1310,13 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
         clip_target.clip = comfy.text_encoders.sd3_clip.sd3_clip(**t5xxl_detect(clip_data))
         clip_target.tokenizer = comfy.text_encoders.sd3_clip.SD3Tokenizer
     elif len(clip_data) == 4:
-        clip_target.clip = comfy.text_encoders.hidream.hidream_clip(**t5xxl_detect(clip_data), **llama_detect(clip_data))
-        clip_target.tokenizer = comfy.text_encoders.hidream.HiDreamTokenizer
+        te_model_4 = detect_te_model(clip_data[0])
+        if te_model_4 == TEModel.QWEN3_8B:
+            clip_target.clip = comfy.text_encoders.flux.klein_te(**llama_detect(clip_data), model_type="qwen3_8b")
+            clip_target.tokenizer = comfy.text_encoders.flux.KleinTokenizer8B
+        else:
+            clip_target.clip = comfy.text_encoders.hidream.hidream_clip(**t5xxl_detect(clip_data), **llama_detect(clip_data))
+            clip_target.tokenizer = comfy.text_encoders.hidream.HiDreamTokenizer
 
     parameters = 0
     for c in clip_data:
