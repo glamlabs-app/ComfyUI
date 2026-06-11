@@ -1,14 +1,24 @@
 import comfy.options
 comfy.options.enable_args_parsing()
 
+from comfy.cli_args import args
+
+if args.list_feature_flags:
+    import json
+    from comfy_api.feature_flags import CLI_FEATURE_FLAG_REGISTRY
+    print(json.dumps(CLI_FEATURE_FLAG_REGISTRY, indent=2))  # noqa: T201
+    raise SystemExit(0)
+
 import os
 import importlib.util
 import shutil
 import importlib.metadata
 import folder_paths
 import time
-from comfy.cli_args import args, enables_dynamic_vram
+from comfy.cli_args import enables_dynamic_vram
 from app.logger import setup_logger
+setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
+
 from app.assets.seeder import asset_seeder
 from app.assets.services import register_output_files
 import itertools
@@ -16,6 +26,7 @@ import utils.extra_config
 from utils.mime_types import init_mime_types
 import faulthandler
 import logging
+import signal
 import sys
 from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
@@ -27,9 +38,19 @@ if __name__ == "__main__":
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
     os.environ['DO_NOT_TRACK'] = '1'
 
-setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
+faulthandler.enable(file=sys.stderr, all_threads=args.debug_hang)
+if __name__ == "__main__" and args.debug_hang:
+    dumping_traceback = False
 
-faulthandler.enable(file=sys.stderr, all_threads=False)
+    def dump_traceback_on_sigint(signum, frame):
+        global dumping_traceback
+        if dumping_traceback:
+            raise KeyboardInterrupt
+        dumping_traceback = True
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, dump_traceback_on_sigint)
 
 import comfy_aimdo.control
 
@@ -210,7 +231,7 @@ import comfy.model_patcher
 if args.enable_dynamic_vram or (enables_dynamic_vram() and comfy.model_management.is_nvidia() and not comfy.model_management.is_wsl()):
     if (not args.enable_dynamic_vram) and (comfy.model_management.torch_version_numeric < (2, 8)):
         logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
-    elif comfy_aimdo.control.init_device(comfy.model_management.get_torch_device().index):
+    elif comfy_aimdo.control.init_devices(d.index for d in comfy.model_management.get_all_torch_devices()):
         if args.verbose == 'DEBUG':
             comfy_aimdo.control.set_log_debug()
         elif args.verbose == 'CRITICAL':
@@ -275,19 +296,25 @@ def _collect_output_absolute_paths(history_result: dict) -> list[str]:
 
 def prompt_worker(q, server_instance):
     current_time: float = 0.0
-    cache_ram = args.cache_ram
-    if cache_ram < 0:
-        cache_ram = min(32.0, max(4.0, comfy.model_management.total_ram * 0.25 / 1024.0))
+    cache_ram = 0
+    cache_ram_inactive = 0
+    if not args.cache_classic and not args.cache_none and args.cache_lru <= 0:
+        cache_ram = min(10.0, max(2.0, comfy.model_management.total_ram * 0.10 / 1024.0))
+        cache_ram_inactive = min(96.0, comfy.model_management.total_ram / 1024.0)
+        if len(args.cache_ram) > 0:
+            cache_ram = args.cache_ram[0]
+        if len(args.cache_ram) > 1:
+            cache_ram_inactive = args.cache_ram[1]
 
-    cache_type = execution.CacheType.CLASSIC
-    if args.cache_lru > 0:
+    cache_type = execution.CacheType.RAM_PRESSURE
+    if args.cache_classic:
+        cache_type = execution.CacheType.CLASSIC
+    elif args.cache_lru > 0:
         cache_type = execution.CacheType.LRU
-    elif cache_ram > 0:
-        cache_type = execution.CacheType.RAM_PRESSURE
     elif args.cache_none:
         cache_type = execution.CacheType.NONE
 
-    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram } )
+    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive } )
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
@@ -330,9 +357,9 @@ def prompt_worker(q, server_instance):
             # Log Time in a more readable way after 10 minutes
             if execution_time > 600:
                 execution_time = time.strftime("%H:%M:%S", time.gmtime(execution_time))
-                logging.info(f"Prompt executed in {execution_time}")
+                logging.info(f"Prompt executed in {execution_time}", extra={'color': 'green'})
             else:
-                logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
+                logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
 
             if not asset_seeder.is_disabled():
                 paths = _collect_output_absolute_paths(e.history_result)
@@ -450,13 +477,6 @@ def start_comfyui(asyncio_loop=None):
         folder_paths.set_temp_directory(temp_dir)
     cleanup_temp()
 
-    if args.windows_standalone_build:
-        try:
-            import new_updater
-            new_updater.update_windows_updater()
-        except:
-            pass
-
     if not asyncio_loop:
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
@@ -470,6 +490,11 @@ def start_comfyui(asyncio_loop=None):
         init_custom_nodes=(not args.disable_all_custom_nodes) or len(args.whitelist_custom_nodes) > 0,
         init_api_nodes=not args.disable_api_nodes
     ))
+
+    # Re-apply Comfy's cuDNN benchmark policy after custom-node imports. Benchmark
+    # mode can request near-card-sized autotune workspaces, and some custom nodes set it at import time.
+    comfy.model_management.set_cudnn_benchmark()
+
     hook_breaker_ac10a0.restore_functions()
 
     cuda_malloc_warning()
