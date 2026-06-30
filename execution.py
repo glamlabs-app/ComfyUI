@@ -200,6 +200,8 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
                 hidden_inputs_v3[io.Hidden.auth_token_comfy_org] = extra_data.get("auth_token_comfy_org", None)
             if io.Hidden.api_key_comfy_org.name in hidden:
                 hidden_inputs_v3[io.Hidden.api_key_comfy_org] = extra_data.get("api_key_comfy_org", None)
+            if io.Hidden.comfy_usage_source.name in hidden:
+                hidden_inputs_v3[io.Hidden.comfy_usage_source] = extra_data.get("comfy_usage_source", None)
     else:
         if "hidden" in valid_inputs:
             h = valid_inputs["hidden"]
@@ -216,6 +218,8 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
                     input_data_all[x] = [extra_data.get("auth_token_comfy_org", None)]
                 if h[x] == "API_KEY_COMFY_ORG":
                     input_data_all[x] = [extra_data.get("api_key_comfy_org", None)]
+                if h[x] == "COMFY_USAGE_SOURCE":
+                    input_data_all[x] = [extra_data.get("comfy_usage_source", None)]
     v3_data["hidden_inputs"] = hidden_inputs_v3
     return input_data_all, missing_keys, v3_data
 
@@ -1303,6 +1307,25 @@ class PromptQueue:
             running = [x for x in self.currently_running.values()]
             queued = copy.copy(self.queue)
             return (running, queued)
+
+    def interrupt_if_running(self, prompt_id):
+        """Interrupt the running prompt with this id, atomically.
+
+        Checks the live running set and signals the interrupt under the queue
+        mutex, so the worker cannot move the job to done (and start the next
+        prompt) in between. Returns True if a matching job was running and an
+        interrupt was signalled, False otherwise. The atomicity is what keeps a
+        cancel from landing on an unrelated prompt that started after a separate
+        is-running check: the global interrupt flag is reset at the start of
+        every prompt (execute_async), so a job that finishes before consuming
+        the flag cannot leak the interrupt onto its successor.
+        """
+        with self.mutex:
+            for item in self.currently_running.values():
+                if item[1] == prompt_id:
+                    nodes.interrupt_processing()
+                    return True
+        return False
 
     def get_tasks_remaining(self):
         with self.mutex:
