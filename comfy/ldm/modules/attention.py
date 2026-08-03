@@ -41,6 +41,8 @@ def install_sageattention_if_needed():
         wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "H100")
     elif arch == 8:
         wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "4090")
+    elif arch == 12:
+        wheel_dir = os.path.join(os.environ.get("WHEELS_DIR", "wheels"), "5090")
     else:
         logging.warning(f"Unsupported GPU arch: {arch}, not installing SageAttention.")
         return
